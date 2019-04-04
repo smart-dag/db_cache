@@ -1,0 +1,20 @@
+[package]
+name = "rcu_hash_table"
+version = "0.1.0"
+authors = ["SDAG<sdag@sdag.io>"]
+edition = "2018"
+
+[lib]
+name = "rcu_hash_table"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rcu_hash_table"
+path = "src/main.rs"
+
+[dependencies]
+rcu_cell = "0.1.7"
+crossbeam = "0.7.1"
+indexmap = "1.0.2"
+may = "0.3.5"
+lazy_static = "1.3.0"
