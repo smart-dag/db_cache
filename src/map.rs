@@ -1,17 +1,16 @@
 use core::fmt::Debug;
-use std::borrow::{Borrow, BorrowMut};
+use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crossbeam::utils::Backoff;
-use rcu_cell::{RcuCell, RcuReader};
+use rcu_cell::RcuCell;
 
 use crate::fifo_cache::FifoCache;
 
 const EMPTY_SEQ: usize = ::std::usize::MAX;
 const TOMB_SEQ: usize = ::std::usize::MAX - 1;
-//const MAX_ACCESS_TIMES: usize = 5;
 
 #[allow(dead_code)]
 pub struct RcuHashMap<K: Debug, V: Debug, H = RandomState> {
@@ -25,16 +24,14 @@ pub struct RcuHashMap<K: Debug, V: Debug, H = RandomState> {
 #[derive(Debug)]
 struct Entry<K: Debug, V: Debug> {
     seq: AtomicUsize,
-    key: Option<K>,
-    value: RcuCell<V>,
+    data: RcuCell<(K, V)>,
 }
 
 impl<K: Debug, V: Debug> Default for Entry<K, V> {
     fn default() -> Self {
         Entry {
             seq: AtomicUsize::new(EMPTY_SEQ),
-            key: None,
-            value: RcuCell::new(None),
+            data: RcuCell::new(None),
         }
     }
 }
@@ -44,13 +41,10 @@ impl<K: Debug, V: Debug> Entry<K, V> {
         self.lock();
 
         let backoff = Backoff::new();
-        self.key = Some(key);
 
         loop {
-            if let Some(mut g) = self.value.try_lock() {
-                if g.as_ref().is_none() {
-                    g.update(Some(data));
-                }
+            if let Some(mut g) = self.data.try_lock() {
+                g.update(Some((key, data)));
                 break;
             }
 
@@ -62,17 +56,22 @@ impl<K: Debug, V: Debug> Entry<K, V> {
     }
 
     fn lock(&self) {
-        let mut cur = self.seq.load(Ordering::Release);
-        while cur == TOMB_SEQ || self.seq.compare_and_swap(cur, TOMB_SEQ, Ordering::Relaxed) != cur
-        {
-            cur = self.seq.load(Ordering::Release);
+        loop {
+            let cur = self.seq.load(Ordering::Relaxed);
+
+            if cur != TOMB_SEQ {
+                self.seq.compare_and_swap(cur, TOMB_SEQ, Ordering::Relaxed);
+                break;
+            }
         }
     }
 
     fn unlock(&self, seq: usize) {
         assert!(seq != TOMB_SEQ);
-        let cur = self.seq.load(Ordering::Release);
-        self.seq.compare_and_swap(cur, seq, Ordering::Relaxed);
+        assert_eq!(
+            self.seq.compare_and_swap(TOMB_SEQ, seq, Ordering::Relaxed),
+            TOMB_SEQ
+        );
     }
 
     // free the entry
@@ -80,10 +79,9 @@ impl<K: Debug, V: Debug> Entry<K, V> {
         self.lock();
 
         let backoff = Backoff::new();
-        self.key = None;
 
         loop {
-            if let Some(mut g) = self.value.try_lock() {
+            if let Some(mut g) = self.data.try_lock() {
                 if g.as_ref().is_some() {
                     g.update(None);
                 }
@@ -98,11 +96,29 @@ impl<K: Debug, V: Debug> Entry<K, V> {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.seq.load(Ordering::Acquire) != EMPTY_SEQ
+        self.seq.load(Ordering::Acquire) == EMPTY_SEQ
     }
 
-    pub fn value(&self) -> Option<RcuReader<V>> {
-        self.value.read()
+    pub fn value(&self) -> Option<V>
+    where
+        V: Clone,
+    {
+        if let Some(v) = self.data.read() {
+            return Some(v.1.clone());
+        }
+
+        None
+    }
+
+    pub fn key(&self) -> Option<K>
+    where
+        K: Clone,
+    {
+        if let Some(v) = self.data.read() {
+            return Some(v.0.clone());
+        }
+
+        None
     }
 
     pub fn seq(&self) -> Option<usize> {
@@ -121,8 +137,8 @@ impl<K: Debug, V: Debug> Entry<K, V> {
 
 impl<K, V> RcuHashMap<K, V, RandomState>
 where
-    K: Hash + Eq + Send + Sync + Debug,
-    V: Send + Sync + Debug,
+    K: Hash + Eq + Send + Sync + Debug + Clone,
+    V: Send + Sync + Debug + Clone,
 {
     /// Creates a new hashmap using default options.
     pub fn new(capacity: usize) -> RcuHashMap<K, V, RandomState> {
@@ -152,7 +168,7 @@ where
         let mut index = (hash & self.mask as u64) as usize;
         let mut j = 0;
         while index < self.items.len() {
-            if let Some(k) = &self.items[index].key {
+            if let Some(k) = &self.items[index].key() {
                 if k.borrow() == key {
                     return Some(&self.items[index]);
                 }
@@ -160,36 +176,10 @@ where
 
             j += 1;
             index = (index + j) & self.mask;
-        }
 
-        None
-    }
-
-    // change seq to normal value after using result
-    fn find_entry_mut<'a, Q: ?Sized>(&mut self, hash: u64, key: &Q) -> Option<&mut Entry<K, V>>
-    where
-        K: BorrowMut<Q> + Hash + Eq,
-        Q: Hash + Eq,
-    {
-        let mut index = (hash & self.mask as u64) as usize;
-        let mut j = 0;
-        //  return Some(&mut self.items[index]);
-        while index < self.items.len() {
-            if let Some(k) = &self.items[index].key {
-                if k.borrow() == key {
-                    // to tell other that we are using this entry
-                    if let Some(seq) = self.items[index].seq() {
-                        self.queue.insert(index, seq);
-                    } else {
-                        self.queue.insert(index, 0);
-                    }
-
-                    return Some(&mut self.items[index]);
-                }
+            if index == self.items.len() - 1 {
+                break;
             }
-
-            j += 1;
-            index = (index + j) & self.mask;
         }
 
         None
@@ -200,25 +190,20 @@ where
     fn find_empty_entry(&mut self, hash: u64) -> Option<&mut Entry<K, V>> {
         let mut index = (hash & self.mask as u64) as usize;
         let mut j = 0;
-        // if self.len > self.mask *
-        let prev = index;
         loop {
-            if index < self.items.len() && self.items[index].is_empty() {
+            if self.items[index].is_empty() {
                 return Some(&mut self.items[index]);
             }
 
             j += 1;
             index = (index + j) & self.mask;
 
-            if prev == index {
+            if index >= self.items.len() - 1 {
                 break;
             }
         }
 
         // remove an item, return the empty item
-        // 1) get index from fifo
-        // 2) remove items[index]
-        // 3) return empty items[index]
         if let Some((index, _)) = self.pop() {
             self.remove_entry(index);
             return Some(&mut self.items[index]);
@@ -241,49 +226,38 @@ where
 
     pub fn insert(&mut self, key: K, value: V) -> bool {
         let hash = self.hash(&key);
-        let entry = self.find_entry_mut(hash, &key);
 
-        if let Some(v) = entry {
-            if let Some(seq) = v.seq() {
-                v.update(seq + 1, key, value);
-            } else {
-                v.update(0, key, value);
+        let mut index = (hash & self.mask as u64) as usize;
+
+        let mut j = 0;
+        loop {
+            if self.items[index].is_empty() {
+                self.items[index].update(0, key, value);
+                self.queue.insert(index, 0);
+                return true;
+            } else if let Some(entry) = self.get_entry(hash, &key) {
+                if let Some(seq) = entry.seq() {
+                    self.items[index].update(seq + 1, key, value);
+                    self.queue.insert(index, seq + 1);
+                    return true;
+                }
+            } else if let Some(entry) = self.find_empty_entry(hash) {
+                entry.update(0, key, value);
+                self.queue.insert(index, 0);
+                return true;
             }
-            return true;
-        }
 
-        if let Some(entry) = self.find_empty_entry(hash) {
-            entry.update(0, key, value);
-            // self.items[0] = entry;
-            return true;
+            j += 1;
+            index = (index + j) & self.mask;
+            if index >= self.items.len() - 1 {
+                break;
+            }
         }
 
         false
-        // let mut index = (hash & self.mask as u64) as usize;
-        // let mut j = 0;
-        // // if self.len > self.mask *
-        // let prev = index;
-        // loop {
-        //     if index < self.items.len() {
-        //         self.items[index] = Entry {
-        //             seq: AtomicUsize::new(0),
-        //             key: Some(key),
-        //             value: RcuCell::new(Some(value)),
-        //         };
-        //         return true;
-        //     }
-
-        //     j += 1;
-        //     index = (index + j) & self.mask;
-
-        //     if prev == index {
-        //         break;
-        //     }
-        // }
-        // false
     }
 
-    pub fn get<'a, Q: ?Sized>(&'a self, key: &Q) -> Option<RcuReader<V>>
+    pub fn get<'a, Q: ?Sized>(&'a self, key: &Q) -> Option<V>
     where
         K: Borrow<Q> + Hash + Eq,
         Q: Hash + Eq,
@@ -340,29 +314,43 @@ where
 
 #[test]
 fn test_len() {
-    let map: RcuHashMap<i32, i32> = RcuHashMap::new(20);
+    let capacity = 20;
 
-    debug_assert!(map.len() == 20, "len = {}", map.len());
+    let map: RcuHashMap<i32, i32> = RcuHashMap::new(capacity);
+    let capacity = capacity.next_power_of_two();
+    debug_assert!(map.len() == capacity, "len = {}", map.len());
 }
 
 #[test]
-fn test_find_entry_mut() {
+fn test_entry() {
+    let entry: Entry<i32, i32> = Default::default();
+    assert_eq!(entry.seq(), None);
+}
+
+#[test]
+fn test_entry_update() {
+    let mut entry: Entry<i32, i32> = Default::default();
+    entry.update(0, 1, 2);
+    assert_eq!(entry.seq(), Some(0));
+    assert_eq!(entry.key(), Some(1));
+    assert_eq!(entry.value(), Some(2));
+
+    entry.update(1, 1, 5);
+    assert_eq!(entry.seq(), Some(1));
+    assert_eq!(entry.key(), Some(1));
+    assert_eq!(entry.value(), Some(5));
+}
+
+#[test]
+fn test_insert() {
     let mut map: RcuHashMap<i32, i32> = RcuHashMap::new(20);
 
-    let hash = map.hash(&2);
-    let entry = map.find_entry_mut(hash, &2);
+    assert_eq!(map.insert(1, 2), true);
+    assert_eq!(map.get(&1), Some(2));
 
-    debug_assert!(entry.is_none(), "value = {:?}", entry);
+    assert_eq!(map.insert(1, 3), true);
+    assert_eq!(map.get(&1), Some(3));
 
-    debug_assert!(
-        entry.as_ref().unwrap().value().map(|v| *v) == Some(2),
-        "value = {:?}",
-        entry.unwrap().value().map(|v| *v)
-    );
-    // map.insert(1, 2);
-    // assert_eq!(map.get(&1).map(|v| *v), Some(2));
-    // assert!(map.get(&2).is_none());
-
-    // map.insert(2, 4);
-    // assert_eq!(map.get(&2).map(|v| *v), Some(4));
+    assert_eq!(map.insert(2, 6), true);
+    assert_eq!(map.get(&2), Some(6));
 }
