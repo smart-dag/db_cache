@@ -36,8 +36,12 @@ impl<K: Eq + Hash, V: Clone> FifoCache<K, V> {
     pub fn remove(&self, k: &K) -> Option<V> {
         self.inner.write().unwrap().remove(k)
     }
-
+ #[inline]
     pub fn is_empty(&self) -> bool {
         self.inner.read().unwrap().is_empty()
+    }
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.inner.read().unwrap().len()
     }
 }

@@ -267,6 +267,10 @@ where
         let entry = self.get_entry(key_hash, key)?;
 
         if let Some(seq) = entry.seq() {
+            if self.queue.len() >= self.mask + 1 {
+                self.pop();
+            }
+
             self.queue.insert(index, seq);
         }
 
