@@ -12,7 +12,6 @@ use crate::fifo_cache::FifoCache;
 const EMPTY_SEQ: usize = ::std::usize::MAX;
 const TOMB_SEQ: usize = ::std::usize::MAX - 1;
 
-#[allow(dead_code)]
 pub struct RcuHashMap<K: Debug, V: Debug, H = RandomState> {
     items: Vec<self::Entry<K, V>>,
     hasher_factory: H,
@@ -204,11 +203,8 @@ where
         }
 
         // remove an item, return the empty item
-        if let Some((index, _)) = self.pop() {
-            self.remove_entry(index);
-            return Some(&mut self.items[index]);
-        }
-        None
+        let (index, _) = self.pop()?;
+        Some(&mut self.items[index])
     }
 
     fn pop(&self) -> Option<(usize, usize)> {
@@ -216,10 +212,6 @@ where
             let (index, seq) = self.queue.pop()?;
             if Some(seq) == self.get_entry_seq(index) {
                 return Some((index, seq));
-            }
-
-            if self.queue.is_empty() {
-                return None;
             }
         }
     }
@@ -234,16 +226,21 @@ where
             if self.items[index].is_empty() {
                 self.items[index].update(0, key, value);
                 self.queue.insert(index, 0);
+                self.len += 1;
                 return true;
             } else if let Some(entry) = self.get_entry(hash, &key) {
                 if let Some(seq) = entry.seq() {
                     self.items[index].update(seq + 1, key, value);
                     self.queue.insert(index, seq + 1);
+
                     return true;
                 }
             } else if let Some(entry) = self.find_empty_entry(hash) {
                 entry.update(0, key, value);
                 self.queue.insert(index, 0);
+                if self.len < self.mask {
+                    self.len += 1;
+                }
                 return true;
             }
 
@@ -294,11 +291,12 @@ where
 
     pub fn remove_entry(&mut self, index: usize) {
         assert!(index < self.items.len());
-        self.items[index].clear()
+        self.items[index].clear();
+        self.len -= 1;
     }
 
     pub fn len(&self) -> usize {
-        self.items.len()
+        self.len
     }
 
     pub fn capacity(&self) -> usize {
@@ -314,15 +312,6 @@ where
         key.hash(&mut hasher);
         hasher.finish()
     }
-}
-
-#[test]
-fn test_len() {
-    let capacity = 20;
-
-    let map: RcuHashMap<i32, i32> = RcuHashMap::new(capacity);
-    let capacity = capacity.next_power_of_two();
-    debug_assert!(map.len() == capacity, "len = {}", map.len());
 }
 
 #[test]
@@ -357,4 +346,15 @@ fn test_insert() {
 
     assert_eq!(map.insert(2, 6), true);
     assert_eq!(map.get(&2), Some(6));
+}
+
+#[test]
+fn test_len() {
+    let capacity = 20;
+
+    let mut map: RcuHashMap<i32, i32> = RcuHashMap::new(capacity);
+    assert_eq!(map.len(), 0);
+    assert_eq!(map.insert(1, 2), true);
+    assert_eq!(map.insert(1, 3), true);
+    assert_eq!(map.len(), 1);
 }
